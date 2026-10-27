@@ -2,15 +2,25 @@
 
 ## Native desktop app
 
-The application uses Rust and Win32 directly through `windows-sys` 0.59. There is no browser, WebView, server, installer, or external runtime. `ui.rs` owns the main window, two accessible owner-drawn native buttons, the notification icon, and a named per-session single-instance mutex. A `RefCell` prevents mutable aliasing when Windows reenters the window procedure. The UI polls an engine snapshot every 60 ms and sends Begin/End/Shutdown commands to its worker.
+The application uses Rust and Win32 directly through `windows-sys` 0.59. There is no browser, WebView, server, installer, or external runtime. `ui.rs` owns the main window, two accessible owner-drawn native buttons, the notification icon, and a named per-session single-instance mutex. A `RefCell` prevents mutable aliasing when Windows reenters the window procedure. The UI polls an engine snapshot every 60 ms and sends Begin/End/SetPeer/Shutdown commands to its worker. Network counters do not cause tray icon replacement or main-window repainting.
+
+`connection.rs` provides the optional modeless Connection window under the overflow menu. It shows physical LAN IPs, an optional peer IPv4 field, packet counters, and the last network error. `Rc<RefCell<Dialog>>` keeps state alive across nested Windows messages and destruction of the owner. Empty input restores automatic discovery. A manual address must be another host on a selected on-link subnet. It is stored beside the executable in `wifiradio.peer`. This window does not block the engine or main window.
 
 The push-to-talk button handles pointer capture, space key transitions, focus loss, and cancellation. Window close, minimize, and Escape hide the window. Only Exit stops the app. The tray icon is restored after an Explorer restart using `TaskbarCreated`.
+
+A second launch captures `GetLastError` immediately after creating the single-instance mutex. It waits briefly for a starting instance's window, grants that process foreground permission, and sends an activation message. The existing UI restores itself and any active owned dialog, including during nested menu/message-box handling. A second launch with `--background` still restores an already running app, which also handles Windows shortcuts containing that flag.
 
 `startup.rs` adds a current-user Run value on first real launch. A marker beside the executable prevents re-enabling startup after the user disables it. Tests use `--no-autostart` and never edit this value.
 
 ## LAN transport
 
-`engine.rs` binds UDP 49735, sends an encrypted Hello once per second to the limited broadcast address and each adapter's directed broadcast address, and unicasts keepalives after discovery. Adapter addresses refresh every ten seconds so Wi-Fi changes recover without restarting. IP TTL is one. A peer expires after five seconds. Bye removes it immediately on a graceful exit. The first authenticated peer is selected; this version is designed for two PCs.
+`engine.rs` binds UDP 49735 and sends an encrypted Hello once per second to the selected LANs' directed broadcast addresses. `network.rs` uses Windows `GetIfEntry2` to prefer active hardware interfaces over TAP/TUN/WireGuard adapters, independent of VPN product names. If no hardware adapter has an eligible IPv4 address, virtual LAN interfaces remain usable. The broadcast is calculated from the address and `OnLinkPrefixLength`; `if-addrs` 0.13 on Windows may derive its separate broadcast/netmask fields from a host /32 prefix instead.
+
+Before each destination change, the outgoing socket is bound to the matching interface with Winsock `IP_UNICAST_IF`, whose interface index must be in network byte order. Packets outside selected on-link subnets are not sent through the VPN/default route. Loopback remains available for local verification. Adapter addresses refresh every ten seconds so Wi-Fi changes recover without restarting. IP TTL is one.
+
+While disconnected, a fallback sends one encrypted unicast Hello every 25 ms to hosts in the local /24-sized block per adapter (or its smaller actual subnet). It excludes own, network, and broadcast addresses. A typical /24 pass takes about seven seconds. It sends only this app's authenticated presence message to UDP 49735, without ICMP/TCP scanning or visiting other blocks of a large LAN. Discovery probes stop while connected. A manual peer address disables broadcast and fallback searches and receives a unicast Hello once per second; authenticated packets from other IPs are ignored. Keepalives, handshakes, and voice use the same explicit interface routing.
+
+A peer expires after five seconds. Bye removes it immediately on a graceful exit. The first authenticated peer is selected in automatic mode; this version is designed for two PCs. Changing connection mode sends Bye, stops capture, and restarts discovery. VPN kill switches and Windows Filtering Platform rules can still block LAN packets; the app never changes those policies or firewall rules.
 
 `protocol.rs` uses XChaCha20-Poly1305 with a random 256-bit build key. `build.rs` creates the ignored `.local/room.key` once and copies it to `OUT_DIR` for embedding. A random 128-bit process identity plus a monotonically increasing 64-bit packet counter form a unique 192-bit nonce. The protocol version `WR01` is authenticated additional data. Packet lengths and message types are validated before use. The selected peer has a 128-packet replay window, allowing bounded UDP reordering and rejecting duplicates. Restarting produces a new identity.
 

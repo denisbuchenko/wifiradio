@@ -1,5 +1,6 @@
 use crate::{
     audio::{self, Capture, Speaker},
+    network::{self, Interface},
     protocol::{Codec, Message, NodeId, FRAME_BYTES, PORT},
     session::{Activity, ReplayWindow, CHIME_MS, PEER_TIMEOUT},
 };
@@ -28,12 +29,24 @@ pub struct View {
     pub phase: Phase,
     pub peer: Option<String>,
     pub error: Option<String>,
+    pub network: NetworkView,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkView {
+    pub interfaces: Vec<Interface>,
+    pub manual_peer: Option<Ipv4Addr>,
+    pub sent: u64,
+    pub received: u64,
+    pub authenticated: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum Command {
     Begin,
     End,
+    SetPeer(Option<Ipv4Addr>),
     Shutdown,
 }
 
@@ -227,6 +240,11 @@ struct Driver<A> {
     hello_at: Instant,
     refresh_at: Instant,
     fixed_destinations: bool,
+    network: NetworkView,
+    probes: Vec<SocketAddr>,
+    probe_index: usize,
+    probe_at: Instant,
+    outgoing_interface: Option<u32>,
 }
 
 impl<A: AudioBackend> Driver<A> {
@@ -239,9 +257,10 @@ impl<A: AudioBackend> Driver<A> {
     ) -> Result<Self, String> {
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         let now = Instant::now();
+        let fixed_destinations = !destinations.is_empty();
         Ok(Self {
             socket,
-            fixed_destinations: !destinations.is_empty(),
+            fixed_destinations,
             destinations,
             codec: Codec::new(key)?,
             audio,
@@ -254,13 +273,52 @@ impl<A: AudioBackend> Driver<A> {
             next_talk: 1,
             hello_at: now,
             refresh_at: now,
+            network: NetworkView {
+                manual_peer: if fixed_destinations {
+                    None
+                } else {
+                    network::load_peer()
+                },
+                ..NetworkView::default()
+            },
+            probes: Vec::new(),
+            probe_index: 0,
+            probe_at: now,
+            outgoing_interface: None,
         })
     }
 
+    fn send_packet(&mut self, packet: &[u8], destination: SocketAddr) {
+        let Some(ip) = network::destination_ip(destination) else {
+            return;
+        };
+        let index = network::route(&self.network.interfaces, ip);
+        if !self.fixed_destinations && index == 0 && !ip.is_loopback() {
+            self.network.last_error =
+                Some(format!("Адрес {ip} вне локальной сети Wi-Fi/Ethernet."));
+            return;
+        }
+        let result = (|| {
+            if self.outgoing_interface != Some(index) {
+                network::set_interface(&self.socket, index)?;
+                self.outgoing_interface = Some(index);
+            }
+            self.socket.send_to(packet, destination)
+        })();
+        match result {
+            Ok(_) => {
+                self.network.sent += 1;
+            }
+            Err(error) => {
+                self.network.last_error = Some(format!("Отправка на {ip}: {error}"));
+            }
+        }
+    }
+
     fn send(&mut self, message: Message) {
-        if let Some(peer) = &self.peer {
+        if let Some(address) = self.peer.as_ref().map(|peer| peer.address) {
             let packet = self.codec.encode(&message);
-            let _ = self.socket.send_to(&packet, peer.address);
+            self.send_packet(&packet, address);
         }
     }
 
@@ -419,34 +477,52 @@ impl<A: AudioBackend> Driver<A> {
             Phase::Offline
         };
         view.peer = self.peer.as_ref().map(|peer| peer.address.ip().to_string());
+        view.network = self.network.clone();
     }
 
     fn tick(&mut self, now: Instant) -> Result<(), String> {
         if now >= self.refresh_at && !self.fixed_destinations {
-            self.destinations = vec![SocketAddr::from((Ipv4Addr::BROADCAST, PORT))];
-            if let Ok(interfaces) = if_addrs::get_if_addrs() {
-                for interface in interfaces {
-                    if let if_addrs::IfAddr::V4(address) = interface.addr {
-                        if !address.ip.is_loopback() {
-                            if let Some(broadcast) = address.broadcast {
-                                let destination = SocketAddr::from((broadcast, PORT));
-                                if !self.destinations.contains(&destination) {
-                                    self.destinations.push(destination);
-                                }
-                            }
-                        }
+            match network::interfaces() {
+                Ok(interfaces) => {
+                    if interfaces != self.network.interfaces {
+                        self.outgoing_interface = None;
+                        self.probes = network::targets(&interfaces);
+                        self.probe_index = 0;
                     }
+                    self.destinations = interfaces
+                        .iter()
+                        .map(|interface| SocketAddr::from((interface.broadcast(), PORT)))
+                        .collect();
+                    self.network.interfaces = interfaces;
                 }
+                Err(error) => self.network.last_error = Some(format!("Сетевые адаптеры: {error}")),
             }
             self.refresh_at = now + Duration::from_secs(10);
         }
         if now >= self.hello_at {
             let packet = self.codec.encode(&Message::Hello);
-            for destination in &self.destinations {
-                let _ = self.socket.send_to(&packet, destination);
+            let destinations = match self.network.manual_peer {
+                Some(ip) => vec![SocketAddr::from((ip, PORT))],
+                None => self.destinations.clone(),
+            };
+            for destination in destinations {
+                self.send_packet(&packet, destination);
             }
             self.send(Message::Hello);
             self.hello_at = now + Duration::from_secs(1);
+        }
+        // Some VPNs and routers drop broadcasts. A bounded, slow unicast Hello
+        // pass discovers this radio on the local /24 without the VPN default route.
+        if self.peer.is_none()
+            && self.network.manual_peer.is_none()
+            && now >= self.probe_at
+            && !self.probes.is_empty()
+        {
+            let target = self.probes[self.probe_index];
+            self.probe_index = (self.probe_index + 1) % self.probes.len();
+            let packet = self.codec.encode(&Message::Hello);
+            self.send_packet(&packet, target);
+            self.probe_at = now + Duration::from_millis(25);
         }
         if self
             .peer
@@ -463,12 +539,26 @@ impl<A: AudioBackend> Driver<A> {
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
                 Err(e) => return Err(format!("Сеть: {e}")),
             };
+            self.network.received += 1;
             let Some((node, counter, message)) = self.codec.decode(&bytes[..length]) else {
                 continue;
             };
             if node == self.codec.node {
                 continue;
             }
+            let Some(ip) = network::destination_ip(source) else {
+                continue;
+            };
+            if !self.fixed_destinations
+                && !ip.is_loopback()
+                && network::route(&self.network.interfaces, ip) == 0
+            {
+                continue;
+            }
+            if self.network.manual_peer.is_some_and(|manual| manual != ip) {
+                continue;
+            }
+            self.network.authenticated += 1;
             if self.peer.is_none() && message == Message::Hello {
                 self.peer = Some(Peer {
                     node,
@@ -562,6 +652,15 @@ impl<A: AudioBackend> Driver<A> {
                         }
                     }
                     Command::End => self.end_transmit(),
+                    Command::SetPeer(peer) => {
+                        self.send(Message::Bye);
+                        self.disconnect();
+                        self.network.manual_peer = peer;
+                        self.network.last_error = None;
+                        self.refresh_at = now;
+                        self.hello_at = now;
+                        self.probe_at = now;
+                    }
                     Command::Shutdown => {
                         shutdown = true;
                         break;
@@ -586,7 +685,7 @@ impl<A: AudioBackend> Driver<A> {
 // startup settings, the tray, or any files other than the requested report.
 pub fn self_test() -> String {
     match loopback_test() {
-        Ok(()) => "PASS: encrypted loopback discovery, three-tone handshake, bidirectional PCM, release, and disconnect. No microphone or registry access.\r\n".into(),
+        Ok(()) => "PASS: encrypted unicast discovery without broadcasts, three-tone handshake, bidirectional PCM, release, and disconnect. No microphone or registry access.\r\n".into(),
         Err(error) => format!("FAIL: {error}\r\n"),
     }
 }
@@ -671,7 +770,11 @@ fn loopback_test() -> Result<(), String> {
             probe: probes[index].clone(),
             next: Instant::now(),
         };
-        let driver = Driver::new(socket, vec![target], &[91; 32], audio, views[index].clone())?;
+        let mut driver = Driver::new(socket, vec![target], &[91; 32], audio, views[index].clone())?;
+        // No broadcast or ordinary Hello destination is available in this scenario.
+        // Discovery must use the same fallback probe path as a VPN-filtered LAN.
+        driver.destinations.clear();
+        driver.probes = vec![target];
         let (send, receive) = mpsc::channel();
         workers.push(thread::spawn(move || driver.run(receive)));
         controls.push(send);
@@ -792,6 +895,24 @@ mod tests {
     #[test]
     fn two_radios_discover_warn_and_exchange_audio_in_both_directions() {
         loopback_test().unwrap();
+    }
+
+    #[test]
+    fn direct_connection_ignores_other_authenticated_radios() {
+        let (mut driver, _, remote) = fixture(1, 2);
+        driver.peer = None;
+        driver.network.manual_peer = Some(Ipv4Addr::new(192, 168, 0, 25));
+        let mut other = Codec::new(&[7; 32]).unwrap();
+        remote
+            .send_to(
+                &other.encode(&Message::Hello),
+                driver.socket.local_addr().unwrap(),
+            )
+            .unwrap();
+        driver.tick(Instant::now()).unwrap();
+        assert!(driver.peer.is_none());
+        assert_eq!(driver.network.received, 1);
+        assert_eq!(driver.network.authenticated, 0);
     }
 
     #[test]
@@ -964,6 +1085,51 @@ mod tests {
             .unwrap();
         assert!(driver.rx.is_none());
         assert_eq!(probe.lock().unwrap().tones, 0);
+    }
+
+    #[test]
+    #[ignore = "requires the release GUI running with --no-autostart and no second peer"]
+    fn native_window_reopens_after_close_on_a_second_launch() {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, IsWindowVisible, PostMessageW, WM_CLOSE,
+        };
+        let class: Vec<u16> = "WifiRadioWindow".encode_utf16().chain(Some(0)).collect();
+        let window = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
+        assert!(
+            !window.is_null(),
+            "Start dist/WifiRadio.exe --no-autostart first"
+        );
+        for _ in 0..3 {
+            unsafe {
+                PostMessageW(window, WM_CLOSE, 0, 0);
+            }
+            wait_until(
+                || unsafe { IsWindowVisible(window) } == 0,
+                Duration::from_secs(2),
+                "close hides the radio",
+            )
+            .unwrap();
+            let mut duplicate = std::process::Command::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/dist/WifiRadio.exe"
+            ))
+            .args(["--no-autostart", "--background"])
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+            wait_until(
+                || unsafe { IsWindowVisible(window) } != 0,
+                Duration::from_secs(3),
+                "a second launch restores the hidden window",
+            )
+            .unwrap();
+            assert!(duplicate.wait().unwrap().success());
+            assert_eq!(
+                unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) },
+                window
+            );
+        }
     }
 
     #[test]

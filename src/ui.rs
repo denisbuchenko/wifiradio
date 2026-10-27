@@ -1,4 +1,5 @@
 use crate::{
+    connection,
     engine::{Command, Handle, Phase, View},
     startup,
 };
@@ -18,12 +19,14 @@ const TRAY_MESSAGE: u32 = WM_APP + 1;
 const PRESS_MESSAGE: u32 = WM_APP + 2;
 const RELEASE_MESSAGE: u32 = WM_APP + 3;
 const QUIT_MESSAGE: u32 = WM_APP + 4;
+const SHOW_MESSAGE: u32 = WM_APP + 5;
 const TALK_ID: usize = 100;
 const MENU_ID: usize = 101;
 const OPEN: u32 = 200;
 const AUTOSTART: u32 = 201;
 const HELP: u32 = 202;
 const EXIT: u32 = 203;
+const CONNECTION: u32 = 204;
 const BG: u32 = rgb(21, 25, 29);
 const FG: u32 = rgb(243, 242, 235);
 const MUTED: u32 = rgb(147, 153, 157);
@@ -74,9 +77,16 @@ impl App {
     }
 
     unsafe fn show(&self) {
-        ShowWindow(self.window, SW_SHOWNORMAL);
-        SetForegroundWindow(self.window);
-        SetFocus(self.talk);
+        restore_window(self.window);
+    }
+
+    unsafe fn connection(&mut self) {
+        self.release();
+        connection::show(
+            self.window,
+            self.engine.commands.clone(),
+            self.engine.view.clone(),
+        );
     }
 
     unsafe fn tray(&mut self, add: bool) {
@@ -115,7 +125,13 @@ impl App {
             .error
             .clone()
             .filter(|error| Some(error) != self.snapshot.error.as_ref());
+        let visual_change = snapshot.phase != self.snapshot.phase
+            || snapshot.peer != self.snapshot.peer
+            || snapshot.error != self.snapshot.error;
         self.snapshot = snapshot;
+        if !visual_change {
+            return;
+        }
         if self.snapshot.peer.is_none() || self.snapshot.phase == Phase::Listening {
             self.release();
         }
@@ -157,6 +173,12 @@ impl App {
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         AppendMenuW(
             menu,
+            MF_STRING,
+            CONNECTION as usize,
+            wide("Подключение…").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
             MF_STRING | if startup::enabled() { MF_CHECKED } else { 0 },
             AUTOSTART as usize,
             wide("Запускать вместе с Windows").as_ptr(),
@@ -192,6 +214,7 @@ impl App {
         DestroyMenu(menu);
         match action as u32 {
             OPEN => self.show(),
+            CONNECTION => self.connection(),
             AUTOSTART => {
                 if let Err(error) = startup::set(!startup::enabled()) {
                     MessageBoxW(
@@ -209,6 +232,7 @@ impl App {
                     2. Подключите оба компьютера к одному роутеру. Wi-Fi и кабель подходят.\n\n\
                     3. Разрешите программе доступ в частную сеть в окне брандмауэра Windows.\n\n\
                     4. Когда кнопка станет жёлтой, держите её или пробел и говорите. После трёх тонов дождитесь надписи «Говорите». Отпустите, чтобы услышать ответ.\n\n\
+                    Если кнопка серая: меню ⋯ → Подключение показывает ваш IP и позволяет указать IP второго ПК. При блокировке локальной сети VPN добавьте WifiRadio.exe в его исключения на обоих ПК.\n\n\
                     Крестик прячет окно в трей. Выход полностью закрывает рацию.\n\n\
                     Вторая рация: {peer}\nПорт: UDP 49735. Интернет не нужен.\n\n\
                     Две копии этого файла используют общий приватный ключ. Другие сборки автоматически к ним не подключаются."
@@ -233,6 +257,20 @@ impl App {
 
 unsafe fn app(window: HWND) -> Option<&'static RefCell<App>> {
     (GetWindowLongPtrW(window, GWLP_USERDATA) as *const RefCell<App>).as_ref()
+}
+
+unsafe fn restore_window(window: HWND) {
+    ShowWindow(window, SW_RESTORE);
+    let popup = GetLastActivePopup(window);
+    let target = if popup.is_null() || popup == window || IsWindowVisible(popup) == 0 {
+        window
+    } else {
+        popup
+    };
+    SetForegroundWindow(target);
+    if target == window {
+        SetFocus(GetDlgItem(window, TALK_ID as i32));
+    }
 }
 
 unsafe extern "system" fn talk_proc(
@@ -289,6 +327,12 @@ unsafe extern "system" fn window_proc(
         DestroyWindow(window);
         return 0;
     }
+    if message == SHOW_MESSAGE {
+        // Activation must work even while a menu or native message box has
+        // reentered this procedure and holds the app's RefCell borrow.
+        restore_window(window);
+        return 0;
+    }
     let Some(cell) = app(window) else {
         return DefWindowProcW(window, message, wparam, lparam);
     };
@@ -318,6 +362,10 @@ unsafe extern "system" fn window_proc(
         }
         WM_COMMAND if (wparam & 0xffff) == MENU_ID => {
             app.popup(false);
+            0
+        }
+        WM_COMMAND if (wparam & 0xffff) == CONNECTION as usize => {
+            app.connection();
             0
         }
         PRESS_MESSAGE => {
@@ -483,7 +531,7 @@ unsafe fn paint(app: &App) {
         "Не удалось подключиться.\nПодробности в меню ⋯"
     } else {
         match app.snapshot.phase {
-            Phase::Offline => "Запустите эту же программу\nна втором компьютере.",
+            Phase::Offline => "Запустите рацию на втором ПК.\nНе находит? Меню ⋯ → Подключение.",
             Phase::Preparing => "Дождитесь трёх коротких тонов.\nПока держите кнопку.",
             Phase::Talking => "Говорите.\nОтпустите кнопку, чтобы слушать.",
             Phase::Listening => "Слушайте.\nСкоро можно будет ответить.",
@@ -709,15 +757,24 @@ pub fn run(background: bool, no_autostart: bool) {
             0,
             wide("Local\\WifiRadio.PrivatePair.v1").as_ptr(),
         );
+        let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
         if mutex.is_null() {
             return;
         }
         let class = wide("WifiRadioWindow");
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            let window = FindWindowW(class.as_ptr(), ptr::null());
-            if !window.is_null() {
-                ShowWindow(window, SW_SHOWNORMAL);
-                SetForegroundWindow(window);
+        if already_running {
+            // The first process may still be creating its native window.
+            for _ in 0..40 {
+                let window = FindWindowW(class.as_ptr(), ptr::null());
+                if !window.is_null() {
+                    let mut process = 0;
+                    GetWindowThreadProcessId(window, &mut process);
+                    AllowSetForegroundWindow(process);
+                    ShowWindowAsync(window, SW_RESTORE);
+                    PostMessageW(window, SHOW_MESSAGE, 0, 0);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             CloseHandle(mutex);
             return;
@@ -833,7 +890,8 @@ pub fn run(background: bool, no_autostart: bool) {
         InvalidateRect(window, ptr::null(), 0);
         let mut message: MSG = zeroed();
         while GetMessageW(&mut message, ptr::null_mut(), 0, 0) > 0 {
-            if IsDialogMessageW(window, &message) == 0 {
+            let root = GetAncestor(message.hwnd, GA_ROOT);
+            if IsDialogMessageW(if root.is_null() { window } else { root }, &message) == 0 {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
