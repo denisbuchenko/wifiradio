@@ -3,6 +3,8 @@
 mod audio;
 mod connection;
 mod engine;
+mod instance;
+mod logging;
 mod network;
 mod protocol;
 mod session;
@@ -10,6 +12,7 @@ mod startup;
 mod ui;
 
 fn main() {
+    logging::initialize();
     let args: Vec<String> = std::env::args().collect();
     if let Some(at) = args.iter().position(|arg| arg == "--diagnostics") {
         let path = args
@@ -34,5 +37,6 @@ fn main() {
     ui::run(
         args.iter().any(|arg| arg == "--background"),
         args.iter().any(|arg| arg == "--no-autostart"),
+        args.iter().any(|arg| arg == "--restart"),
     );
 }

@@ -1,7 +1,7 @@
 use crate::{
     connection,
     engine::{Command, Handle, Phase, View},
-    startup,
+    instance, logging, startup,
 };
 use std::{
     cell::RefCell,
@@ -11,15 +11,15 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
+    System::LibraryLoader::GetModuleHandleW,
     UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const PRESS_MESSAGE: u32 = WM_APP + 2;
 const RELEASE_MESSAGE: u32 = WM_APP + 3;
-const QUIT_MESSAGE: u32 = WM_APP + 4;
-const SHOW_MESSAGE: u32 = WM_APP + 5;
+const QUIT_MESSAGE: u32 = instance::QUIT;
+const SHOW_MESSAGE: u32 = instance::SHOW;
 const TALK_ID: usize = 100;
 const MENU_ID: usize = 101;
 const OPEN: u32 = 200;
@@ -27,6 +27,8 @@ const AUTOSTART: u32 = 201;
 const HELP: u32 = 202;
 const EXIT: u32 = 203;
 const CONNECTION: u32 = 204;
+const HIDE: u32 = 205;
+const RESTART: u32 = 206;
 const BG: u32 = rgb(21, 25, 29);
 const FG: u32 = rgb(243, 242, 235);
 const MUTED: u32 = rgb(147, 153, 157);
@@ -55,6 +57,12 @@ struct App {
     small: HFONT,
     title: HFONT,
     label: HFONT,
+    no_autostart: bool,
+}
+
+struct WindowContext {
+    state: RefCell<App>,
+    commands: std::sync::mpsc::Sender<Command>,
 }
 
 impl App {
@@ -107,13 +115,35 @@ impl App {
         });
         data.szTip[..tip.len()].copy_from_slice(&tip);
         let result = Shell_NotifyIconW(if add { NIM_ADD } else { NIM_MODIFY }, &data);
+        let result = if result == 0 && !add {
+            Shell_NotifyIconW(NIM_ADD, &data)
+        } else {
+            result
+        };
+        let result = if result == 0 && add {
+            Shell_NotifyIconW(NIM_MODIFY, &data)
+        } else {
+            result
+        };
+        self.tray_added = result != 0;
         if result != 0 {
-            self.tray_added = true;
+            logging::write("notification icon registered");
         }
         if !self.icon.is_null() {
             DestroyIcon(self.icon);
         }
         self.icon = new_icon;
+    }
+
+    unsafe fn hide(&mut self) {
+        self.release();
+        self.tray(false);
+        if self.tray_added {
+            ShowWindow(self.window, SW_HIDE);
+        } else {
+            logging::write("notification icon unavailable; keeping window reachable");
+            ShowWindow(self.window, SW_MINIMIZE);
+        }
     }
 
     unsafe fn refresh(&mut self) {
@@ -151,7 +181,9 @@ impl App {
         InvalidateRect(self.window, ptr::null(), 0);
         InvalidateRect(self.talk, ptr::null(), 0);
         if let Some(error) = new_error {
+            logging::write(&format!("visible runtime error: {error}"));
             self.release();
+            self.show();
             MessageBoxW(
                 self.window,
                 wide(&error).as_ptr(),
@@ -174,6 +206,12 @@ impl App {
         AppendMenuW(
             menu,
             MF_STRING,
+            HIDE as usize,
+            wide("Убрать в трей").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
             CONNECTION as usize,
             wide("Подключение…").as_ptr(),
         );
@@ -190,6 +228,12 @@ impl App {
             wide("Как подключиться").as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            RESTART as usize,
+            wide("Перезапустить рацию").as_ptr(),
+        );
         AppendMenuW(menu, MF_STRING, EXIT as usize, wide("Выход").as_ptr());
         let mut point: POINT = zeroed();
         if at_cursor {
@@ -214,6 +258,25 @@ impl App {
         DestroyMenu(menu);
         match action as u32 {
             OPEN => self.show(),
+            HIDE => self.hide(),
+            RESTART => {
+                self.release();
+                if let Ok(exe) = std::env::current_exe() {
+                    let mut command = std::process::Command::new(exe);
+                    command.arg("--restart");
+                    if self.no_autostart {
+                        command.arg("--no-autostart");
+                    }
+                    if let Err(error) = command.spawn() {
+                        MessageBoxW(
+                            self.window,
+                            wide(&format!("Не удалось перезапустить рацию: {error}")).as_ptr(),
+                            wide("Рядом").as_ptr(),
+                            MB_OK | MB_ICONERROR,
+                        );
+                    }
+                }
+            }
             CONNECTION => self.connection(),
             AUTOSTART => {
                 if let Err(error) = startup::set(!startup::enabled()) {
@@ -233,7 +296,7 @@ impl App {
                     3. Разрешите программе доступ в частную сеть в окне брандмауэра Windows.\n\n\
                     4. Когда кнопка станет жёлтой, держите её или пробел и говорите. После трёх тонов дождитесь надписи «Говорите». Отпустите, чтобы услышать ответ.\n\n\
                     Если кнопка серая: меню ⋯ → Подключение показывает ваш IP и позволяет указать IP второго ПК. При блокировке локальной сети VPN добавьте WifiRadio.exe в его исключения на обоих ПК.\n\n\
-                    Крестик прячет окно в трей. Выход полностью закрывает рацию.\n\n\
+                    Крестик полностью закрывает рацию. Сворачивание оставляет её на панели задач. Фоновый режим: ⋯ → Убрать в трей. Повторный запуск возвращает окно.\n\n\
                     Вторая рация: {peer}\nПорт: UDP 49735. Интернет не нужен.\n\n\
                     Две копии этого файла используют общий приватный ключ. Другие сборки автоматически к ним не подключаются."
                 );
@@ -256,10 +319,17 @@ impl App {
 }
 
 unsafe fn app(window: HWND) -> Option<&'static RefCell<App>> {
-    (GetWindowLongPtrW(window, GWLP_USERDATA) as *const RefCell<App>).as_ref()
+    context(window).map(|context| &context.state)
+}
+
+unsafe fn context(window: HWND) -> Option<&'static WindowContext> {
+    (GetWindowLongPtrW(window, GWLP_USERDATA) as *const WindowContext).as_ref()
 }
 
 unsafe fn restore_window(window: HWND) {
+    // The first ShowWindow can be overridden by STARTUPINFO (e.g. a hidden
+    // launcher). Consume that hint, then obey the user's explicit open request.
+    ShowWindow(window, SW_SHOW);
     ShowWindow(window, SW_RESTORE);
     let popup = GetLastActivePopup(window);
     let target = if popup.is_null() || popup == window || IsWindowVisible(popup) == 0 {
@@ -323,6 +393,9 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == instance::VERSION {
+        return instance::TOKEN;
+    }
     if message == QUIT_MESSAGE {
         DestroyWindow(window);
         return 0;
@@ -331,6 +404,29 @@ unsafe extern "system" fn window_proc(
         // Activation must work even while a menu or native message box has
         // reentered this procedure and holds the app's RefCell borrow.
         restore_window(window);
+        return 1;
+    }
+    if message == WM_CLOSE {
+        if let Some(context) = context(window) {
+            let _ = context.commands.send(Command::End);
+        }
+        PostMessageW(window, QUIT_MESSAGE, 0, 0);
+        return 0;
+    }
+    if message == WM_DESTROY {
+        // Destruction is also delivered inside TrackPopupMenu/MessageBox. It
+        // must not depend on borrowing App, or a windowless process survives.
+        if let Some(context) = context(window) {
+            let _ = context.commands.send(Command::Shutdown);
+        }
+        let mut data: NOTIFYICONDATAW = zeroed();
+        data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = window;
+        data.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &data);
+        KillTimer(window, 1);
+        logging::write("window destroyed; quitting message loop");
+        PostQuitMessage(0);
         return 0;
     }
     let Some(cell) = app(window) else {
@@ -368,6 +464,10 @@ unsafe extern "system" fn window_proc(
             app.connection();
             0
         }
+        WM_COMMAND if (wparam & 0xffff) == HIDE as usize => {
+            app.hide();
+            0
+        }
         PRESS_MESSAGE => {
             app.press();
             0
@@ -386,17 +486,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_KEYDOWN if wparam == VK_ESCAPE as usize => {
             app.release();
-            ShowWindow(window, SW_HIDE);
-            0
-        }
-        WM_CLOSE => {
-            app.release();
-            ShowWindow(window, SW_HIDE);
+            ShowWindow(window, SW_MINIMIZE);
             0
         }
         WM_SIZE if wparam == SIZE_MINIMIZED as usize => {
             app.release();
-            ShowWindow(window, SW_HIDE);
             0
         }
         TRAY_MESSAGE => {
@@ -405,18 +499,6 @@ unsafe extern "system" fn window_proc(
                 WM_RBUTTONUP => app.popup(true),
                 _ => {}
             }
-            0
-        }
-        WM_DESTROY => {
-            app.release();
-            let _ = app.engine.commands.send(Command::Shutdown);
-            let mut data: NOTIFYICONDATAW = zeroed();
-            data.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-            data.hWnd = window;
-            data.uID = 1;
-            Shell_NotifyIconW(NIM_DELETE, &data);
-            KillTimer(window, 1);
-            PostQuitMessage(0);
             0
         }
         _ => DefWindowProcW(window, message, wparam, lparam),
@@ -748,37 +830,20 @@ unsafe fn radio_icon(connected: bool) -> HICON {
     )
 }
 
-pub fn run(background: bool, no_autostart: bool) {
+pub fn run(background: bool, no_autostart: bool, restart: bool) {
     unsafe {
         // System scaling keeps the fixed-size interface readable on high-DPI PCs.
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE_GDISCALED);
-        let mutex = CreateMutexW(
-            ptr::null(),
-            0,
-            wide("Local\\WifiRadio.PrivatePair.v1").as_ptr(),
-        );
-        let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
-        if mutex.is_null() {
-            return;
-        }
-        let class = wide("WifiRadioWindow");
-        if already_running {
-            // The first process may still be creating its native window.
-            for _ in 0..40 {
-                let window = FindWindowW(class.as_ptr(), ptr::null());
-                if !window.is_null() {
-                    let mut process = 0;
-                    GetWindowThreadProcessId(window, &mut process);
-                    AllowSetForegroundWindow(process);
-                    ShowWindowAsync(window, SW_RESTORE);
-                    PostMessageW(window, SHOW_MESSAGE, 0, 0);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+        logging::write("launch requested");
+        let _instance = match instance::enter(restart) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return,
+            Err(error) => {
+                startup_error(&error);
+                return;
             }
-            CloseHandle(mutex);
-            return;
-        }
+        };
+        let class = wide("WifiRadioWindow");
         let instance = GetModuleHandleW(ptr::null());
         let mut wc: WNDCLASSW = zeroed();
         wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -788,7 +853,10 @@ pub fn run(background: bool, no_autostart: bool) {
         wc.lpszClassName = class.as_ptr();
         wc.hIcon = radio_icon(true);
         if RegisterClassW(&wc) == 0 {
-            CloseHandle(mutex);
+            startup_error(&format!(
+                "Не удалось создать класс окна: {}",
+                std::io::Error::last_os_error()
+            ));
             return;
         }
         let mut app = Box::new(App {
@@ -805,6 +873,7 @@ pub fn run(background: bool, no_autostart: bool) {
             small: font(12, FW_NORMAL),
             title: font(34, FW_SEMIBOLD),
             label: font(18, FW_SEMIBOLD),
+            no_autostart,
         });
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         let mut rect = RECT {
@@ -817,7 +886,7 @@ pub fn run(background: bool, no_autostart: bool) {
         let window = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("Рядом · Wi-Fi рация").as_ptr(),
+            wide(&format!("Рядом · Рация {}", env!("CARGO_PKG_VERSION"))).as_ptr(),
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -829,7 +898,10 @@ pub fn run(background: bool, no_autostart: bool) {
             ptr::null(),
         );
         if window.is_null() {
-            CloseHandle(mutex);
+            startup_error(&format!(
+                "Не удалось создать окно: {}",
+                std::io::Error::last_os_error()
+            ));
             return;
         }
         app.window = window;
@@ -864,13 +936,16 @@ pub fn run(background: bool, no_autostart: bool) {
             instance,
             ptr::null(),
         );
-        let app = Box::new(RefCell::new(*app));
+        let context = Box::new(WindowContext {
+            commands: app.engine.commands.clone(),
+            state: RefCell::new(*app),
+        });
         SetWindowLongPtrW(
             window,
             GWLP_USERDATA,
-            (&*app as *const RefCell<App>) as isize,
+            (&*context as *const WindowContext) as isize,
         );
-        let mut state = app.borrow_mut();
+        let mut state = context.state.borrow_mut();
         state.tray(true);
         SetTimer(window, 1, 60, None);
         if !no_autostart {
@@ -883,7 +958,7 @@ pub fn run(background: bool, no_autostart: bool) {
                 );
             }
         }
-        if !background {
+        if !background || !state.tray_added {
             state.show();
         }
         drop(state);
@@ -897,12 +972,26 @@ pub fn run(background: bool, no_autostart: bool) {
             }
         }
         SetWindowLongPtrW(window, GWLP_USERDATA, 0);
-        let app = app.borrow();
+        let app = context.state.borrow();
         DestroyIcon(app.icon);
         DestroyIcon(wc.hIcon);
         for font in [app.font, app.small, app.title, app.label] {
             DeleteObject(font);
         }
-        CloseHandle(mutex);
+        logging::write("UI shutdown complete");
     }
+}
+
+unsafe fn startup_error(error: &str) {
+    logging::write(error);
+    MessageBoxW(
+        ptr::null_mut(),
+        wide(&format!(
+            "{error}\n\nРядом {}. Журнал: wifiradio.log рядом с программой.",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .as_ptr(),
+        wide("Рядом · ошибка запуска").as_ptr(),
+        MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
+    );
 }

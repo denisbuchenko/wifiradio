@@ -79,6 +79,11 @@ pub fn initialize() -> Result<(), String> {
     // value itself stays authoritative, so Windows Settings can disable it.
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let marker = exe.with_file_name("wifiradio.initialized");
+    if marker.exists() && enabled() {
+        // A versioned update can have a new filename. Preserve disabled startup,
+        // but migrate an enabled entry so sign-in does not revive an old binary.
+        set(true)?;
+    }
     if !marker.exists() {
         set(true)?;
         std::fs::write(

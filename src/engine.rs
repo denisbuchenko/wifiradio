@@ -93,7 +93,15 @@ impl Drop for Handle {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Shutdown);
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            let deadline = Instant::now() + Duration::from_millis(800);
+            while !worker.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            } else {
+                crate::logging::write("audio/network worker did not stop within 800 ms; process exit releases devices");
+            }
         }
     }
 }
@@ -1089,10 +1097,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires the release GUI running with --no-autostart and no second peer"]
-    fn native_window_reopens_after_close_on_a_second_launch() {
+    fn native_window_reopens_after_explicit_tray_hide_on_a_second_launch() {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, IsWindowVisible, PostMessageW, WM_CLOSE,
+            FindWindowW, IsWindowVisible, PostMessageW, WM_COMMAND,
         };
         let class: Vec<u16> = "WifiRadioWindow".encode_utf16().chain(Some(0)).collect();
         let window = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
@@ -1102,12 +1110,12 @@ mod tests {
         );
         for _ in 0..3 {
             unsafe {
-                PostMessageW(window, WM_CLOSE, 0, 0);
+                PostMessageW(window, WM_COMMAND, 205, 0);
             }
             wait_until(
                 || unsafe { IsWindowVisible(window) } == 0,
                 Duration::from_secs(2),
-                "close hides the radio",
+                "explicit tray action hides the radio",
             )
             .unwrap();
             let mut duplicate = std::process::Command::new(concat!(

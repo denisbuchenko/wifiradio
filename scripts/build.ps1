@@ -27,4 +27,10 @@ Copy-Item -LiteralPath README.md -Destination dist/README.md
 Copy-Item -LiteralPath LICENSE -Destination dist/LICENSE
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath dist/WifiRadio.exe).Hash.ToLowerInvariant()
 [System.IO.File]::WriteAllText((Join-Path $projectRoot 'dist/WifiRadio.exe.sha256'), "$hash  WifiRadio.exe`r`n")
+$packageVersion = [regex]::Match((Get-Content -LiteralPath Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+if (-not $packageVersion) { throw 'Package version is missing.' }
+$versionedName = "WifiRadio-$packageVersion.exe"
+Copy-Item -LiteralPath dist/WifiRadio.exe -Destination (Join-Path dist $versionedName)
+[System.IO.File]::WriteAllText((Join-Path $projectRoot "dist/$versionedName.sha256"), "$hash  $versionedName`r`n")
 Write-Output 'Ready: dist/WifiRadio.exe'
+Write-Output "Update without overwriting a running executable: dist/$versionedName"

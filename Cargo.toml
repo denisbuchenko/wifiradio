@@ -1,6 +1,6 @@
 [package]
 name = "wifiradio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A tiny private push-to-talk radio for two Windows PCs on the same LAN"
 license = "MIT"
